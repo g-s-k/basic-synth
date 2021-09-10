@@ -1,18 +1,21 @@
 use std::{
     f32::consts::TAU,
     io::{stdin, stdout, Write},
-    process,
-    sync::mpsc::{self, Sender},
+    mem, process,
+    sync::mpsc::{self, Sender, TryRecvError},
     thread,
+    time::Duration,
 };
 
 use {
     midi_msg::*,
     midir::{Ignore, MidiInput},
-    rodio::{buffer::SamplesBuffer, source::Source, OutputStream, Sink},
+    rodio::{buffer::SamplesBuffer, OutputStream, Sink},
 };
 
 const SAMPLE_RATE: u32 = 44100;
+const BLOCKS_PER_SECOND: u32 = 100;
+const BLOCK_SIZE: u32 = SAMPLE_RATE / BLOCKS_PER_SECOND;
 
 fn main() {
     let mut midi_in = MidiInput::new("basic-synth").expect("Could not create MIDI Input object");
@@ -24,7 +27,13 @@ fn main() {
             eprintln!("No MIDI ports available");
             process::exit(101);
         }
-        [only_one] => only_one,
+        [only_one] => {
+            eprintln!(
+                "Connecting to MIDI port: {}",
+                midi_in.port_name(only_one).unwrap()
+            );
+            only_one
+        }
         otherwise => {
             println!("More than one MIDI port is available:");
             for (i, p) in otherwise.iter().enumerate() {
@@ -46,54 +55,75 @@ fn main() {
     };
 
     let _conn_in = midi_in
-        .connect(in_port, "basic-synth-midi-in", process_midi, Synth::new(16))
+        .connect(in_port, "basic-synth-midi-in", process_midi, run_synth_bg())
         .expect("Failed to connect to MIDI source");
 
     let mut input = String::new();
     stdin().read_line(&mut input).unwrap();
 }
 
-fn process_midi(stamp: u64, message: &[u8], synth: &mut Synth) {
-    let (msg, len) = MidiMsg::from_midi(message).expect("Bad MIDI data");
-    match msg {
-        MidiMsg::ChannelVoice {
-            msg: ChannelVoiceMsg::NoteOn { note, velocity },
-            ..
-        } => {
-            if let Some(v) = synth.get_new_voice() {
-                v.on = true;
-                v.note = note;
-                v.tx.send(VoiceMessage::Start {
-                    note,
-                    vel: velocity,
-                })
-                .expect("Failed to send NoteOn message");
-            } else {
-                eprintln!(
-                    "Out of voices. Note requested was {} with velocity {}",
-                    note, velocity
-                );
+fn process_midi(_stamp: u64, message: &[u8], tx: &mut Sender<MidiMsg>) {
+    let (msg, _len) = MidiMsg::from_midi(message).expect("Bad MIDI data");
+    tx.send(msg)
+        .expect("Failed to send message to synth thread");
+}
+
+fn run_synth_bg() -> Sender<MidiMsg> {
+    let (tx, rx) = mpsc::channel::<MidiMsg>();
+
+    thread::spawn(move || {
+        let mut synth = Synth::new(16);
+        let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+        let sink = Sink::try_new(&stream_handle).unwrap();
+
+        loop {
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    let buffer: Vec<f32> = (0..BLOCK_SIZE).flat_map(|_| synth.next()).collect();
+                    sink.append(SamplesBuffer::new(1, SAMPLE_RATE, buffer));
+                    // wait half of a block so we don't get too far ahead
+                    thread::sleep(Duration::from_millis(500 / BLOCKS_PER_SECOND as u64));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!(
+                        "Synth thread disconnected from main thread unexpectedly. Shutting down."
+                    );
+                }
+                Ok(MidiMsg::ChannelVoice {
+                    msg: ChannelVoiceMsg::NoteOn { note, velocity },
+                    ..
+                }) => {
+                    if let Some(v) = synth.get_new_voice() {
+                        v.on = true;
+                        v.set_note(note);
+                    } else {
+                        eprintln!(
+                            "Out of voices. Note requested was {} with velocity {}",
+                            note, velocity
+                        );
+                    }
+                }
+                Ok(MidiMsg::ChannelVoice {
+                    msg: ChannelVoiceMsg::NoteOff { note, .. },
+                    ..
+                }) => {
+                    if let Some(v) = synth.get_playing_voice(note) {
+                        v.on = false;
+                    } else {
+                        eprintln!(
+                            "Expected a voice playing note {} but could not find one",
+                            note
+                        );
+                    }
+                }
+                Ok(other_msg) => {
+                    println!("{:?}", other_msg);
+                }
             }
         }
-        MidiMsg::ChannelVoice {
-            msg: ChannelVoiceMsg::NoteOff { note, .. },
-            ..
-        } => {
-            if let Some(v) = synth.get_playing_voice(note) {
-                v.on = false;
-                v.tx.send(VoiceMessage::Stop)
-                    .expect("Failed to send NoteOff message");
-            } else {
-                eprintln!(
-                    "Expected a voice playing note {} but could not find one",
-                    note
-                );
-            }
-        }
-        _ => {
-            println!("{}: {:?} (len = {})", stamp, msg, len);
-        }
-    }
+    });
+
+    tx
 }
 
 struct Synth {
@@ -128,60 +158,54 @@ impl Synth {
     }
 }
 
-#[derive(Debug)]
+impl Iterator for Synth {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.voices.iter_mut().flat_map(|v| v.next()).sum())
+    }
+}
+
+#[derive(Debug, Default)]
 struct Voice {
     on: bool,
     note: u8,
-    tx: Sender<VoiceMessage>,
+    oscillators: [Oscillator; 3],
 }
 
-impl Default for Voice {
-    fn default() -> Self {
-        let (tx, rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-            let sink = Sink::try_new(&stream_handle).unwrap();
-
-            for msg in rx {
-                match msg {
-                    VoiceMessage::Start { note, vel } => {
-                        let freq = midi_frequency(note);
-                        let period = (1.0 / freq * SAMPLE_RATE as f32).round() as usize;
-                        let freq_const = TAU * freq / SAMPLE_RATE as f32;
-
-                        let buffer_ary: Vec<_> = (0..period)
-                            .map(|samp| (freq_const * samp as f32).sin())
-                            .collect();
-
-                        sink.append(
-                            SamplesBuffer::new(1, SAMPLE_RATE, buffer_ary)
-                                .amplify(vel as f32 / 127.0)
-                                .repeat_infinite(),
-                        );
-                    }
-                    VoiceMessage::Stop => {
-                        sink.stop();
-                    }
-                }
-            }
-        });
-
-        Self {
-            on: false,
-            note: 0,
-            tx,
+impl Voice {
+    fn set_note(&mut self, new_note: u8) {
+        self.note = new_note;
+        for osc in &mut self.oscillators {
+            osc.current_freq = (2_f32).powf((self.note as i16 - 69) as f32 / 12.0) * 440.0;
         }
     }
 }
 
-#[derive(Debug)]
-enum VoiceMessage {
-    Start { note: u8, vel: u8 },
-    Stop,
+impl Iterator for Voice {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // TODO replace with EG
+        if !self.on {
+            return Some(0.0);
+        }
+
+        Some(self.oscillators.iter_mut().flat_map(|o| o.next()).sum())
+    }
 }
 
-fn midi_frequency(note: u8) -> f32 {
-    // A4 is note number 69 and has frequency 440
-    (2_f32).powf((note as f32 - 69.0) / 12.0) * 440.0
+#[derive(Debug, Default)]
+struct Oscillator {
+    current_phase: f32,
+    current_freq: f32,
+}
+
+impl Iterator for Oscillator {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next_phase = (self.current_phase + TAU * self.current_freq / SAMPLE_RATE as f32) % TAU;
+        Some(mem::replace(&mut self.current_phase, next_phase).sin())
+    }
 }
