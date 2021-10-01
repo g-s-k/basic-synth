@@ -192,6 +192,7 @@ struct Voice {
     note: u8,
     detune: u8,
     oscillators: [Oscillator; 3],
+    filter: Filter<2>,
     amp_eg: Adsr,
 }
 
@@ -202,6 +203,7 @@ impl Voice {
             note: 0,
             detune: 5,
             oscillators: Default::default(),
+            filter: Default::default(),
             amp_eg: Adsr::new(amp_env_config),
         }
     }
@@ -250,8 +252,9 @@ impl Iterator for Voice {
             .flat_map(|o| o.next())
             .sum::<f32>()
             / (self.oscillators.len() as f32);
+        let filtered = self.filter.process(osc_mix);
         let amp_volume = self.amp_eg.next().unwrap();
-        Some(osc_mix * amp_volume)
+        Some(filtered * amp_volume)
     }
 }
 
@@ -304,6 +307,38 @@ impl Waveform {
             Self::Pulse => -1.0,
             Self::Saw => (phase / PI) - 1.0,
         }
+    }
+}
+
+#[derive(Debug)]
+struct Filter<const N: usize> {
+    alpha: f32,
+    last_per_pole: [f32; N],
+}
+
+impl<const N: usize> Default for Filter<N> {
+    fn default() -> Self {
+        Self {
+            alpha: Self::calculate_alpha(5000.0),
+            last_per_pole: [0.0; N],
+        }
+    }
+}
+
+impl<const N: usize> Filter<N> {
+    // see https://dsp.stackexchange.com/a/54088
+    fn calculate_alpha(cutoff: f32) -> f32 {
+        let y = 1.0 - (TAU * cutoff / OVERSAMPLE_RATE as f32).cos();
+        -y + (y.powi(2) + 2.0 * y).sqrt()
+    }
+
+    fn process(&mut self, mut sample: f32) -> f32 {
+        for last in &mut self.last_per_pole {
+            sample *= self.alpha;
+            sample += (1.0 - self.alpha) * *last;
+            *last = sample;
+        }
+        sample
     }
 }
 
