@@ -1,7 +1,8 @@
 use std::{
-    f32::consts::TAU,
+    f32::consts::{PI, TAU},
     io::{stdin, stdout, Write},
-    mem, process,
+    mem, ops, process,
+    rc::Rc,
     sync::mpsc::{self, Sender, TryRecvError},
     thread, time,
 };
@@ -94,9 +95,9 @@ fn run_synth_bg() -> Sender<MidiMsg> {
                     ..
                 }) => {
                     if let Some(v) = synth.get_playing_voice(note) {
-                        v.begin_note(note);
+                        v.begin_note(note, velocity);
                     } else if let Some(v) = synth.get_new_voice() {
-                        v.begin_note(note);
+                        v.begin_note(note, velocity);
                     } else {
                         eprintln!(
                             "Out of voices. Note requested was {} with velocity {}",
@@ -133,8 +134,11 @@ struct Synth {
 
 impl Synth {
     fn new(voices: usize) -> Self {
+        let amp_env_config = Rc::new(AdsrConfig::default());
         Self {
-            voices: (0..voices).map(|_| Voice::default()).collect(),
+            voices: (0..voices)
+                .map(move |_| Voice::new(amp_env_config.clone()))
+                .collect(),
         }
     }
 
@@ -175,27 +179,47 @@ impl Iterator for Synth {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Voice {
     on: bool,
     note: u8,
+    detune: u8,
     oscillators: [Oscillator; 3],
     amp_eg: Adsr,
 }
 
 impl Voice {
-    fn begin_note(&mut self, new_note: u8) {
+    fn new(amp_env_config: Rc<AdsrConfig>) -> Self {
+        Self {
+            on: false,
+            note: 0,
+            detune: 5,
+            oscillators: Default::default(),
+            amp_eg: Adsr::new(amp_env_config),
+        }
+    }
+
+    fn begin_note(&mut self, new_note: u8, new_vel: u8) {
         self.on = true;
         self.note = new_note;
-        for osc in &mut self.oscillators {
-            osc.current_freq = (2_f32).powf((self.note as i16 - 69) as f32 / 12.0) * 440.0;
+        let detune_amount = self.detune as f32 / 100.0;
+        let num_oscs = self.oscillators.len() as f32;
+        for (index, osc) in self.oscillators.iter_mut().enumerate() {
+            let note_plus_detune = self.note as f32
+                + map_range(
+                    index as f32,
+                    (0.0, num_oscs),
+                    (-detune_amount, detune_amount),
+                );
+            osc.current_freq = (2_f32).powf((note_plus_detune - 69.0) / 12.0) * 440.0;
         }
         self.amp_eg.segment = AdsrSegment::Attack(0.0, self.amp_eg.next().unwrap());
+        self.amp_eg.velocity_ratio = new_vel as f32 / 127.0;
     }
 
     fn end_note(&mut self) {
         let release_point = if let AdsrSegment::Sustain = self.amp_eg.segment {
-            self.amp_eg.sustain_amount
+            self.amp_eg.config.sustain_amount
         } else {
             self.amp_eg.next().unwrap()
         };
@@ -220,9 +244,6 @@ impl Iterator for Voice {
             .sum::<f32>()
             / (self.oscillators.len() as f32);
         let amp_volume = self.amp_eg.next().unwrap();
-        if amp_volume > 1.0 {
-            println!("amp volume: {}", amp_volume);
-        }
         Some(osc_mix * amp_volume)
     }
 }
@@ -231,6 +252,7 @@ impl Iterator for Voice {
 struct Oscillator {
     current_phase: f32,
     current_freq: f32,
+    wave: Waveform,
 }
 
 impl Default for Oscillator {
@@ -239,9 +261,10 @@ impl Default for Oscillator {
             current_phase: (time::SystemTime::now()
                 .duration_since(time::UNIX_EPOCH)
                 .unwrap()
-                .as_millis()
+                .as_nanos()
                 % 360) as f32,
             current_freq: 0.0,
+            wave: Waveform::Saw,
         }
     }
 }
@@ -251,27 +274,44 @@ impl Iterator for Oscillator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let next_phase = (self.current_phase + TAU * self.current_freq / SAMPLE_RATE as f32) % TAU;
-        Some(mem::replace(&mut self.current_phase, next_phase).sin())
+        Some(
+            self.wave
+                .sample(mem::replace(&mut self.current_phase, next_phase)),
+        )
+    }
+}
+
+#[derive(Debug)]
+enum Waveform {
+    Sine,
+    Pulse,
+    Saw,
+}
+
+impl Waveform {
+    fn sample(&self, phase: f32) -> f32 {
+        match self {
+            Self::Sine => phase.sin(),
+            Self::Pulse if phase < PI => 1.0,
+            Self::Pulse => -1.0,
+            Self::Saw => (phase / PI) - 1.0,
+        }
     }
 }
 
 #[derive(Debug)]
 struct Adsr {
+    config: Rc<AdsrConfig>,
     segment: AdsrSegment,
-    attack_time: f32,
-    decay_time: f32,
-    sustain_amount: f32,
-    release_time: f32,
+    velocity_ratio: f32,
 }
 
-impl Default for Adsr {
-    fn default() -> Self {
+impl Adsr {
+    fn new(config: Rc<AdsrConfig>) -> Self {
         Self {
+            config,
             segment: AdsrSegment::Off,
-            attack_time: 0.5,
-            decay_time: 0.5,
-            sustain_amount: 0.5,
-            release_time: 1.0,
+            velocity_ratio: 0.0,
         }
     }
 }
@@ -280,49 +320,84 @@ impl Iterator for Adsr {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(match self.segment {
+        let raw_amplitude = match self.segment {
             AdsrSegment::Off => 0.0,
             AdsrSegment::Attack(amt, _) if amt >= 1.0 => {
                 self.segment = AdsrSegment::Decay(0.0);
                 1.0
             }
             AdsrSegment::Attack(current_amt, start_point) => {
-                self.segment =
-                    AdsrSegment::Attack(current_amt + self.attack_time / SAMPLE_RATE as f32, start_point);
-                // (y2 - y1) = m * (x2 - x1)
-                // (y2 - start_point) = (1.0 - start_point) * (x2 - 0.0)
-                // y2 = (1.0 - start_point) * x2 + start_point
-                (1.0 - start_point) * current_amt + start_point
+                // velocity scaling - TODO use an actual mod matrix instead of hard coding
+                let vel_scaled_attack_slope = 1.0
+                    / map_range(
+                        self.velocity_ratio,
+                        (0.0, 1.0),
+                        (self.config.attack_time, 0.0),
+                    );
+                self.segment = AdsrSegment::Attack(
+                    current_amt + vel_scaled_attack_slope / SAMPLE_RATE as f32,
+                    start_point,
+                );
+                map_range(current_amt, (0.0, 1.0), (start_point, 1.0))
             }
             AdsrSegment::Decay(amt) if amt >= 1.0 => {
                 self.segment = AdsrSegment::Sustain;
-                self.sustain_amount
+                self.config.sustain_amount
             }
             AdsrSegment::Decay(current_amt) => {
+                // velocity scaling - TODO use an actual mod matrix instead of hard coding
+                let vel_scaled_decay_slope = 1.0
+                    / map_range(
+                        self.velocity_ratio,
+                        (0.0, 1.0),
+                        (self.config.decay_time, 0.0),
+                    );
                 self.segment =
-                    AdsrSegment::Decay(current_amt + self.decay_time / SAMPLE_RATE as f32);
-                // (y2 - y1) = m * (x2 - x1)
-                // (y2 - 1.0) = -(1 - sustain) * (x2 - 0.0)
-                // y2 = (sustain - 1) * x2 + 1.0
-                (self.sustain_amount - 1.0) * current_amt + 1.0
+                    AdsrSegment::Decay(current_amt + vel_scaled_decay_slope / SAMPLE_RATE as f32);
+                map_range(current_amt, (0.0, 1.0), (1.0, self.config.sustain_amount))
             }
-            AdsrSegment::Sustain => self.sustain_amount,
+            AdsrSegment::Sustain => self.config.sustain_amount,
             AdsrSegment::Release(amt, _) if amt >= 1.0 => {
                 self.segment = AdsrSegment::Off;
                 0.0
             }
             AdsrSegment::Release(current_amt, release_point) => {
+                // velocity scaling - TODO use an actual mod matrix instead of hard coding
+                let vel_scaled_release_slope = 1.0
+                    / map_range(
+                        self.velocity_ratio,
+                        (0.0, 1.0),
+                        (self.config.release_time, 0.0),
+                    );
                 self.segment = AdsrSegment::Release(
-                    current_amt + self.release_time / SAMPLE_RATE as f32,
+                    current_amt + vel_scaled_release_slope / SAMPLE_RATE as f32,
                     release_point,
                 );
-                // (y2 - y1) = m * (x2 - x1)
-                // (y2 - release_point) = (-release_point) * (x2 - 0.0)
-                // y2 = (-release_point) * x2 + release_point
-                // y2 = release_point * (1.0 - x2)
-                release_point * (1.0 - current_amt)
+                map_range(current_amt, (0.0, 1.0), (release_point, 0.0))
             }
-        })
+        };
+
+        // velocity scaling - TODO make the depth changeable via CC
+        Some(raw_amplitude * map_range(self.velocity_ratio, (0.0, 1.0), (0.25, 1.0)))
+    }
+}
+
+#[derive(Debug)]
+struct AdsrConfig {
+    attack_time: f32,
+    decay_time: f32,
+    sustain_amount: f32,
+    release_time: f32,
+}
+
+impl Default for AdsrConfig {
+    fn default() -> Self {
+        Self {
+            attack_time: 0.5,
+            decay_time: 0.5,
+            sustain_amount: 0.5,
+            release_time: 1.0,
+        }
     }
 }
 
@@ -333,4 +408,19 @@ enum AdsrSegment {
     Decay(f32),
     Sustain,
     Release(f32, f32),
+}
+
+/// Transform a value from one range into another, relative to those ranges' limits.
+///
+/// To obtain an inversed relationship, put the "new" range in backward (from top to bottom).
+fn map_range<T>(quantity: T, (bottom_old, top_old): (T, T), (bottom_new, top_new): (T, T)) -> T
+where
+    T: Copy
+        + ops::Add<Output = T>
+        + ops::Sub<Output = T>
+        + ops::Div<Output = T>
+        + ops::Mul<Output = T>,
+{
+    let rel_qty = (quantity - bottom_old) / (top_old - bottom_old);
+    rel_qty * (top_new - bottom_new) + bottom_new
 }
