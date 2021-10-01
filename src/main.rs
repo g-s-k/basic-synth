@@ -14,6 +14,8 @@ use {
 };
 
 const SAMPLE_RATE: u32 = 48000;
+const OVERSAMPLE_RATIO: u32 = 4;
+const OVERSAMPLE_RATE: u32 = SAMPLE_RATE * OVERSAMPLE_RATIO;
 const BLOCKS_PER_SECOND: u32 = 100;
 const BLOCK_SIZE: u32 = SAMPLE_RATE / BLOCKS_PER_SECOND;
 
@@ -80,7 +82,7 @@ fn run_synth_bg() -> Sender<MidiMsg> {
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => {
                     // don't get ahead of ourselves
-                    if sink.len() < 3 {
+                    if sink.len() < 4 {
                         let buffer: Vec<f32> = (0..BLOCK_SIZE).flat_map(|_| synth.next()).collect();
                         sink.append(SamplesBuffer::new(1, SAMPLE_RATE, buffer));
                     }
@@ -170,11 +172,16 @@ impl Iterator for Synth {
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(
-            self.voices
-                .iter_mut()
-                .flat_map(|v| v.next())
-                .map(|v| (v * 0.75).min(1.0))
-                .sum(),
+            (0..OVERSAMPLE_RATIO)
+                .map(|_| {
+                    self.voices
+                        .iter_mut()
+                        .flat_map(|v| v.next())
+                        .map(|v| (v * 0.75).min(1.0))
+                        .sum::<f32>()
+                })
+                .nth(0)
+                .unwrap(),
         )
     }
 }
@@ -273,7 +280,8 @@ impl Iterator for Oscillator {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_phase = (self.current_phase + TAU * self.current_freq / SAMPLE_RATE as f32) % TAU;
+        let next_phase =
+            (self.current_phase + TAU * self.current_freq / OVERSAMPLE_RATE as f32) % TAU;
         Some(
             self.wave
                 .sample(mem::replace(&mut self.current_phase, next_phase)),
@@ -335,7 +343,7 @@ impl Iterator for Adsr {
                         (self.config.attack_time, 0.0),
                     );
                 self.segment = AdsrSegment::Attack(
-                    current_amt + vel_scaled_attack_slope / SAMPLE_RATE as f32,
+                    current_amt + vel_scaled_attack_slope / OVERSAMPLE_RATE as f32,
                     start_point,
                 );
                 map_range(current_amt, (0.0, 1.0), (start_point, 1.0))
@@ -352,8 +360,9 @@ impl Iterator for Adsr {
                         (0.0, 1.0),
                         (self.config.decay_time, 0.0),
                     );
-                self.segment =
-                    AdsrSegment::Decay(current_amt + vel_scaled_decay_slope / SAMPLE_RATE as f32);
+                self.segment = AdsrSegment::Decay(
+                    current_amt + vel_scaled_decay_slope / OVERSAMPLE_RATE as f32,
+                );
                 map_range(current_amt, (0.0, 1.0), (1.0, self.config.sustain_amount))
             }
             AdsrSegment::Sustain => self.config.sustain_amount,
@@ -370,7 +379,7 @@ impl Iterator for Adsr {
                         (self.config.release_time, 0.0),
                     );
                 self.segment = AdsrSegment::Release(
-                    current_amt + vel_scaled_release_slope / SAMPLE_RATE as f32,
+                    current_amt + vel_scaled_release_slope / OVERSAMPLE_RATE as f32,
                     release_point,
                 );
                 map_range(current_amt, (0.0, 1.0), (release_point, 0.0))
