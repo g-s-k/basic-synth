@@ -11,7 +11,14 @@ use {
     rodio::{buffer::SamplesBuffer, OutputStream, Sink},
 };
 
-use basic_synth::{Synth, BLOCK_SIZE, SAMPLE_RATE};
+use basic_synth::{Synth, SAMPLE_RATE};
+
+const BLOCKS_PER_SECOND: u32 = 100;
+const BLOCKS_BUFFER: usize = 4;
+
+fn block_size() -> u32 {
+    unsafe { SAMPLE_RATE / BLOCKS_PER_SECOND }
+}
 
 fn main() {
     let mut midi_in = MidiInput::new("basic-synth").expect("Could not create MIDI Input object");
@@ -76,9 +83,10 @@ fn run_synth_bg() -> Sender<MidiMsg> {
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => {
                     // don't get ahead of ourselves
-                    if sink.len() < 4 {
-                        let buffer: Vec<f32> = (0..BLOCK_SIZE).flat_map(|_| synth.next()).collect();
-                        sink.append(SamplesBuffer::new(1, SAMPLE_RATE, buffer));
+                    if sink.len() < BLOCKS_BUFFER {
+                        let buffer: Vec<f32> =
+                            (0..block_size()).flat_map(|_| synth.next()).collect();
+                        sink.append(SamplesBuffer::new(1, unsafe { SAMPLE_RATE }, buffer));
                     }
                 }
                 Err(TryRecvError::Disconnected) => {

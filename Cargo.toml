@@ -9,7 +9,7 @@ name = "basic_synth"
 path = "src/lib.rs"
 
 [[bin]]
-name = "basic-synth"
+name = "basic-synth-cli"
 path = "src/main.rs"
 
 [dependencies]

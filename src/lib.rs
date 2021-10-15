@@ -5,17 +5,23 @@ use std::{
     time,
 };
 
-pub static SAMPLE_RATE: u32 = 48000;
-static OVERSAMPLE_RATIO: u32 = 4;
-static OVERSAMPLE_RATE: u32 = SAMPLE_RATE * OVERSAMPLE_RATIO;
-static BLOCKS_PER_SECOND: u32 = 100;
-pub static BLOCK_SIZE: u32 = SAMPLE_RATE / BLOCKS_PER_SECOND;
+/// Modify this value to work at a different sample rate.
+pub static mut SAMPLE_RATE: u32 = 48000;
 
+/// Level of oversampling applied for antialiasing purposes.
+pub static mut OVERSAMPLE_RATIO: u32 = 4;
+
+fn oversample_rate() -> u32 {
+    unsafe { SAMPLE_RATE * OVERSAMPLE_RATIO }
+}
+
+/// Represents a full instance of a synthesizer.
 pub struct Synth {
     voices: Vec<Voice>,
 }
 
 impl Synth {
+    /// Create a new synth, with the specified number of voices.
     pub fn new(voices: usize) -> Self {
         let amp_env_config = Rc::new(AdsrConfig::default());
         Self {
@@ -25,6 +31,10 @@ impl Synth {
         }
     }
 
+    /// Start playing the specified MIDI note number, if a voice is available.
+    ///
+    /// Returns `Ok` if a voice was available to play the note, and `Err` if all voices are
+    /// already playing.
     pub fn try_begin_note(&mut self, note: u8, velocity: u8) -> Result<(), ()> {
         if let Some(v) = self.get_playing_voice(note) {
             v.begin_note(note, velocity);
@@ -37,6 +47,10 @@ impl Synth {
         }
     }
 
+    /// Stop playing the specified MIDI note number, if it is being played.
+    ///
+    /// Returns `Ok` if the note was successfully ended, and `Err` if no voice was found playing
+    /// that note.
     pub fn try_end_note(&mut self, note: u8) -> Result<(), ()> {
         if let Some(v) = self.get_playing_voice(note) {
             v.end_note();
@@ -69,12 +83,16 @@ impl Synth {
     }
 }
 
+/// Audio generation is implemented as an Iterator of `f32`.
+///
+/// Call the `next` method to generate the next sample. Note that the output is at the sample rate
+/// specified as a public mutable `static` rather than at the oversampled rate.
 impl Iterator for Synth {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(
-            (0..OVERSAMPLE_RATIO)
+            (0..unsafe { OVERSAMPLE_RATIO })
                 .map(|_| {
                     self.voices
                         .iter_mut()
@@ -186,7 +204,7 @@ impl Iterator for Oscillator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let next_phase =
-            (self.current_phase + TAU * self.current_freq / OVERSAMPLE_RATE as f32) % TAU;
+            (self.current_phase + TAU * self.current_freq / oversample_rate() as f32) % TAU;
         Some(
             self.wave
                 .sample(mem::replace(&mut self.current_phase, next_phase)),
@@ -230,7 +248,7 @@ impl<const N: usize> Default for Filter<N> {
 impl<const N: usize> Filter<N> {
     // see https://dsp.stackexchange.com/a/54088
     fn calculate_alpha(cutoff: f32) -> f32 {
-        let y = 1.0 - (TAU * cutoff / OVERSAMPLE_RATE as f32).cos();
+        let y = 1.0 - (TAU * cutoff / oversample_rate() as f32).cos();
         -y + (y.powi(2) + 2.0 * y).sqrt()
     }
 
@@ -280,7 +298,7 @@ impl Iterator for Adsr {
                         (self.config.attack_time, 0.0),
                     );
                 self.segment = AdsrSegment::Attack(
-                    current_amt + vel_scaled_attack_slope / OVERSAMPLE_RATE as f32,
+                    current_amt + vel_scaled_attack_slope / oversample_rate() as f32,
                     start_point,
                 );
                 map_range(current_amt, (0.0, 1.0), (start_point, 1.0))
@@ -298,7 +316,7 @@ impl Iterator for Adsr {
                         (self.config.decay_time, 0.0),
                     );
                 self.segment = AdsrSegment::Decay(
-                    current_amt + vel_scaled_decay_slope / OVERSAMPLE_RATE as f32,
+                    current_amt + vel_scaled_decay_slope / oversample_rate() as f32,
                 );
                 map_range(current_amt, (0.0, 1.0), (1.0, self.config.sustain_amount))
             }
@@ -316,7 +334,7 @@ impl Iterator for Adsr {
                         (self.config.release_time, 0.0),
                     );
                 self.segment = AdsrSegment::Release(
-                    current_amt + vel_scaled_release_slope / OVERSAMPLE_RATE as f32,
+                    current_amt + vel_scaled_release_slope / oversample_rate() as f32,
                     release_point,
                 );
                 map_range(current_amt, (0.0, 1.0), (release_point, 0.0))
