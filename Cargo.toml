@@ -4,7 +4,13 @@ version = "0.1.0"
 authors = ["George Kaplan <gkaplan@fearless.tech>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "basic_synth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "basic-synth"
+path = "src/main.rs"
 
 [dependencies]
 midi-msg = "0.3.0"
